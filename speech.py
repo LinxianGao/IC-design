@@ -50,14 +50,14 @@ class SpeechModule:
     def warn_obstacle_full(self, direction: str, distance: float, obs_type: str, level: int) -> None:
         """
         【一体化核心播报】方向+距离+类型+危险等级+行动指引
-        :param direction: 方位（左侧/右侧/正前）
+        :param direction: 方位（左前方/右前方/正前方）
         :param distance: 距离（米）
         :param obs_type: 类型（person/car/bicycle/obstacle）
         :param level: 危险等级 0-4
         """
         # 类型映射（转为自然语言）
         type_map = {
-            "person": "行人",
+            "person":"行人",
             "car": "车辆",
             "bicycle": "非机动车",
             "obstacle": "障碍物"

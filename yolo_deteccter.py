@@ -10,6 +10,7 @@ yolo_detector.py - YOLO 检测模块
 - 帧率监控
 - 日志记录
 - 配置管理
+- 多模态感知融合（目标检测 + 盲道分割 + 交通标志OCR）
 """
 
 import sophon.sail as sail
@@ -31,7 +32,8 @@ class Config:
         self.frame_skip = 2
         self.alert_cooldown = 2.0
         self.camera_id = 0
-        self.bmodel_path = "/data/dataset/bmodels/ten_classes_f32.bmodel"
+        self.bmodel_path = "/data/dataset/bmodels/ten_agu_f32.bmodel"
+        self.blind_road_bmodel_path = "/data/dataset/bmodels/blind_road_f32.bmodel"
         self.focal_length = 500      # 相机焦距（像素）
         self.object_height = 0.8     # 物体实际高度（米）
         
@@ -60,7 +62,6 @@ class Logger:
         if not enabled:
             return
         
-        # 确保日志目录存在
         log_dir = os.path.dirname(log_file)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
@@ -68,15 +69,12 @@ class Logger:
         self.logger = logging.getLogger('BlindAssistant')
         self.logger.setLevel(logging.INFO)
         
-        # 文件处理器
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.INFO)
         
-        # 控制台处理器
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
         
-        # 格式化
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         fh.setFormatter(formatter)
         ch.setFormatter(formatter)
@@ -106,7 +104,6 @@ class FPSMonitor:
         self.fps = 0
     
     def update(self):
-        """更新 FPS"""
         self.frame_count += 1
         current_time = time.time()
         if current_time - self.last_time >= 1.0:
@@ -119,10 +116,124 @@ class FPSMonitor:
         return self.fps
     
     def reset(self):
-        """重置计数器"""
         self.frame_count = 0
         self.last_time = time.time()
         self.fps = 0
+
+
+# ==================== 盲道检测器类 ====================
+class BlindRoadDetector:
+    """盲道检测器"""
+    
+    def __init__(self, bmodel_path, conf_thresh=0.3):
+        self.conf_thresh = conf_thresh
+        self.engine = sail.Engine(bmodel_path, 0, sail.IOMode.SYSIO)
+        self.graph_name = self.engine.get_graph_names()[0]
+        self.input_name = self.engine.get_input_names(self.graph_name)[0]
+        self.input_shape = self.engine.get_input_shape(self.graph_name, self.input_name)
+        self.output_names = self.engine.get_output_names(self.graph_name)
+        self.input_h, self.input_w = self.input_shape[2], self.input_shape[3]
+    
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-x))
+    
+    def detect(self, img):
+        """检测盲道"""
+        h_img, w_img = img.shape[:2]
+        
+        # 预处理
+        img_resized = cv2.resize(img, (self.input_w, self.input_h))
+        img_input = img_resized.transpose(2, 0, 1).astype(np.float32)
+        img_input = np.expand_dims(img_input, axis=0)
+        
+        # 推理
+        outputs = self.engine.process(self.graph_name, {self.input_name: img_input})
+        
+        if 'output0_Concat' in outputs:
+            out = outputs['output0_Concat']
+            detections = []
+            
+            for i in range(out.shape[2]):
+                cx = out[0, 0, i]
+                cy = out[0, 1, i]
+                bw = out[0, 2, i]
+                bh = out[0, 3, i]
+                conf = self.sigmoid(out[0, 4, i])
+                
+                if conf < self.conf_thresh:
+                    continue
+                
+                x1 = (cx - bw/2) * w_img
+                y1 = (cy - bh/2) * h_img
+                x2 = (cx + bw/2) * w_img
+                y2 = (cy + bh/2) * h_img
+                
+                detections.append({
+                    'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                    'confidence': float(conf)
+                })
+            
+            return detections
+        
+        return []
+    
+    def get_nearest(self, img):
+        """获取最近盲道信息"""
+        detections = self.detect(img)
+        if detections:
+            nearest = min(detections, key=lambda x: x['bbox'][3] - x['bbox'][1])
+            h_img = img.shape[0]
+            center_y = (nearest['bbox'][1] + nearest['bbox'][3]) // 2
+            distance = (h_img - center_y) / h_img * 5  # 粗略估算
+            
+            return {
+                'detected': True,
+                'direction': '正前方',
+                'distance': round(distance, 1),
+                'bbox': nearest['bbox'],
+                'confidence': nearest['confidence']
+            }
+        
+        return {'detected': False, 'direction': None, 'distance': None}
+
+
+# ==================== 交通标志识别类（OCR） ====================
+class TrafficSignRecognizer:
+    """交通标志文字识别器"""
+    
+    def __init__(self, use_ocr=True):
+        self.use_ocr = use_ocr
+        if use_ocr:
+            try:
+                import easyocr
+                self.reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+                self.available = True
+            except ImportError:
+                print("easyocr 未安装，交通标志文字识别功能禁用")
+                self.available = False
+        else:
+            self.available = False
+    
+    def recognize(self, img, bbox):
+        """识别交通标志中的文字"""
+        if not self.available:
+            return None
+        
+        try:
+            x1, y1, x2, y2 = bbox
+            roi = img[y1:y2, x1:x2]
+            if roi.size == 0:
+                return None
+            
+            results = self.reader.readtext(roi)
+            if results:
+                text = ' '.join([r[1] for r in results])
+                confidence = sum([r[2] for r in results]) / len(results)
+                return {'text': text, 'confidence': round(confidence, 2)}
+        except Exception as e:
+            print(f"OCR识别失败: {e}")
+        
+        return None
 
 
 # ==================== YOLO 检测器类 ====================
@@ -168,14 +279,14 @@ class YOLODetector:
         
         # 解析输入输出信息
         self.batch_size, self.channels, self.input_h, self.input_w = self.input_shape
-        self.num_classes = None  # 将在第一次推理时确定
+        self.num_classes = None
         
         self.logger.info(f"输入形状: {self.input_shape}")
         self.logger.info(f"输出名称: {self.output_names}")
         print(f"输入形状: {self.input_shape}")
         print(f"输出名称: {self.output_names}")
         
-        # 类别名称（根据 data.yaml 设置）
+        # 类别名称
         self.class_names = {
             0: 'construction_sign',
             1: 'zebra_crossing',
@@ -189,7 +300,6 @@ class YOLODetector:
             9: 'd_bicycle'
         }
         
-        # 中文类别名称
         self.class_names_zh = {
             0: '施工标志',
             1: '斑马线',
@@ -202,18 +312,27 @@ class YOLODetector:
             8: '黑夜汽车',
             9: '黑夜自行车'
         }
+        
+        # 初始化盲道检测器
+        self.blind_road_detector = None
+        if os.path.exists(self.config.blind_road_bmodel_path):
+            try:
+                self.blind_road_detector = BlindRoadDetector(self.config.blind_road_bmodel_path)
+                self.logger.info("盲道检测器初始化成功")
+            except Exception as e:
+                self.logger.warning(f"盲道检测器初始化失败: {e}")
+        
+        # 初始化交通标志识别器
+        self.sign_recognizer = TrafficSignRecognizer(use_ocr=True)
     
     # ==================== 基础函数 ====================
     def sigmoid(self, x):
-        """sigmoid 激活函数"""
         return 1 / (1 + np.exp(-x))
     
     def get_fps(self):
-        """获取当前 FPS"""
         return self.fps_monitor.get_fps()
     
     def update_fps(self):
-        """更新 FPS 统计"""
         return self.fps_monitor.update()
     
     # ==================== 方向判断函数 ====================
@@ -255,13 +374,11 @@ class YOLODetector:
         focal_length = focal_length or self.config.focal_length
         object_height = object_height or self.config.object_height
         
-        # 方法1: 基于深度图
         if depth_map is not None:
             try:
                 x1, y1, x2, y2 = bbox
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
-                # 确保坐标在范围内
                 h, w = depth_map.shape[:2]
                 center_x = max(0, min(w-1, center_x))
                 center_y = max(0, min(h-1, center_y))
@@ -271,7 +388,6 @@ class YOLODetector:
             except Exception as e:
                 self.logger.warning(f"深度图距离估算失败: {e}")
         
-        # 方法2: 基于单目视觉
         x1, y1, x2, y2 = bbox
         box_height = y2 - y1
         if box_height > 0:
@@ -280,55 +396,52 @@ class YOLODetector:
         
         return -1
     
+    # ==================== 盲道检测函数 ====================
+    def detect_blind_road(self, img):
+        """检测盲道"""
+        if self.blind_road_detector:
+            return self.blind_road_detector.get_nearest(img)
+        return {'detected': False, 'direction': None, 'distance': None}
+    
+    # ==================== 交通标志文字识别 ====================
+    def recognize_sign_text(self, img, bbox):
+        """识别交通标志文字"""
+        if self.sign_recognizer.available:
+            return self.sign_recognizer.recognize(img, bbox)
+        return None
+    
     # ==================== 解码函数 ====================
     def decode_yolov8(self, output, img_shape):
-        """
-        解码 YOLOv8 输出
-        
-        Args:
-            output: 模型输出，形状为 (1, num_classes+4, num_boxes)
-            img_shape: 原始图像形状 (height, width)
-        
-        Returns:
-            detections: 检测结果列表，每个元素为 [x1, y1, x2, y2, class_id, confidence]
-        """
+        """解码 YOLOv8 输出"""
         h_img, w_img = img_shape[:2]
-        
-        # 解析输出维度
         _, feat_dim, num_boxes = output.shape
         self.num_classes = feat_dim - 4
         
         detections = []
         
         for i in range(num_boxes):
-            # 获取边界框坐标 (归一化的中心点 + 宽高)
             cx = output[0, 0, i]
             cy = output[0, 1, i]
             bw = output[0, 2, i]
             bh = output[0, 3, i]
-            
-            # 目标置信度
             conf = self.sigmoid(output[0, 4, i])
+            
             if conf < self.conf_thresh:
                 continue
             
-            # 类别分数
             cls_scores = output[0, 5:self.num_classes+5, i]
             cls_id = np.argmax(cls_scores)
             cls_conf = self.sigmoid(cls_scores[cls_id])
-            
-            # 综合置信度
             score = conf * cls_conf
+            
             if score < self.conf_thresh:
                 continue
             
-            # 转换到原图坐标
             x1 = (cx - bw / 2) * w_img
             y1 = (cy - bh / 2) * h_img
             x2 = (cx + bw / 2) * w_img
             y2 = (cy + bh / 2) * h_img
             
-            # 裁剪到图像边界内
             x1 = max(0, int(x1))
             y1 = max(0, int(y1))
             x2 = min(w_img, int(x2))
@@ -340,17 +453,7 @@ class YOLODetector:
         return detections
     
     def decode_yolov5(self, outputs, img_shape):
-        """
-        解码 YOLOv5 输出（3个输出层）
-        
-        Args:
-            outputs: 模型输出字典
-            img_shape: 原始图像形状
-        
-        Returns:
-            detections: 检测结果列表
-        """
-        # YOLOv5 的 anchor 参数（根据你的模型调整）
+        """解码 YOLOv5 输出"""
         anchors = [
             [(10, 13), (16, 30), (33, 23)],
             [(30, 61), (62, 45), (59, 119)],
@@ -368,12 +471,10 @@ class YOLODetector:
             for a in range(num_anchors):
                 for i in range(grid_h):
                     for j in range(grid_w):
-                        # 目标置信度
                         conf = self.sigmoid(out[0, a, i, j, 4])
                         if conf < self.conf_thresh:
                             continue
                         
-                        # 类别分数
                         cls_scores = out[0, a, i, j, 5:]
                         cls_id = np.argmax(cls_scores)
                         cls_conf = self.sigmoid(cls_scores[cls_id])
@@ -382,7 +483,6 @@ class YOLODetector:
                         if score < self.conf_thresh:
                             continue
                         
-                        # 解码边界框
                         tx = out[0, a, i, j, 0]
                         ty = out[0, a, i, j, 1]
                         tw = out[0, a, i, j, 2]
@@ -446,7 +546,7 @@ class YOLODetector:
         img_input = np.expand_dims(img_input, axis=0)
         return img_input
     
-    # ==================== 检测函数 ====================
+    # ==================== 核心检测函数 ====================
     def detect(self, img, with_info=False):
         """
         检测图像中的目标
@@ -456,28 +556,19 @@ class YOLODetector:
             with_info: 是否返回方向、距离等信息
         
         Returns:
-            detections: 检测结果列表，每个元素为 [x1, y1, x2, y2, class_id, confidence]
-            detections_info: (可选) 包含方向、距离的详细信息
+            detections: 检测结果列表
         """
-        # 更新帧率
         fps = self.update_fps()
-        
-        # 预处理
         img_input = self.preprocess(img)
-        
-        # 推理
         outputs = self.engine.process(self.graph_name, {self.input_name: img_input})
         
-        # 解码
         if 'output0_Concat' in outputs:
             detections = self.decode_yolov8(outputs['output0_Concat'], img.shape)
         else:
             detections = self.decode_yolov5(outputs, img.shape)
         
-        # NMS
         detections = self.nms(detections)
         
-        # 可选：添加详细信息
         if with_info:
             h_img, w_img = img.shape[:2]
             detections_info = []
@@ -507,47 +598,93 @@ class YOLODetector:
             return []
         return self.detect(img, with_info)
     
+    # ==================== 多模态感知融合 ====================
+    def perceive(self, img, with_ocr=True):
+        """
+        多模态感知：融合目标检测、盲道检测、交通标志识别
+        
+        Args:
+            img: OpenCV 图像
+            with_ocr: 是否进行OCR识别
+        
+        Returns:
+            perception_result: 综合感知结果字典
+        """
+        # 初始化结果
+        perception_result = {
+            "direction": None,
+            "distance": None,
+            "obs_type": None,
+            "obs_on_blind_road": False,
+            "blind_road_detected": False,
+            "blind_road_direction": None,
+            "blind_road_distance": None,
+            "sign_content": None,
+            "sign_distance": None,
+            "sign_direction": None
+        }
+        
+        # 1. 目标检测
+        detections = self.detect(img, with_info=True)
+        
+        if detections:
+            # 找出最近的障碍物
+            nearest = min(detections, key=lambda x: x['distance'])
+            perception_result["direction"] = nearest['direction']
+            perception_result["distance"] = nearest['distance']
+            perception_result["obs_type"] = nearest['class_name_zh']
+            
+            # 2. 检查障碍物是否在盲道上（需要盲道信息）
+            blind_road_info = self.detect_blind_road(img)
+            if blind_road_info['detected']:
+                # 简化判断：检查障碍物是否在盲道区域附近
+                obs_center = (nearest['bbox'][0] + nearest['bbox'][2]) // 2
+                road_center = (blind_road_info['bbox'][0] + blind_road_info['bbox'][2]) // 2 if 'bbox' in blind_road_info else None
+                if road_center and abs(obs_center - road_center) < 100:
+                    perception_result["obs_on_blind_road"] = True
+        
+        # 3. 盲道检测
+        blind_road_info = self.detect_blind_road(img)
+        if blind_road_info['detected']:
+            perception_result["blind_road_detected"] = True
+            perception_result["blind_road_direction"] = blind_road_info['direction']
+            perception_result["blind_road_distance"] = blind_road_info['distance']
+        
+        # 4. 交通标志识别（仅对施工标志等交通标志类进行OCR）
+        if with_ocr:
+            for det in detections:
+                # 只对施工标志进行OCR识别
+                if det['class_id'] in [0, 2, 3]:  # 施工标志、禁止通行、公交站牌
+                    sign_text = self.recognize_sign_text(img, det['bbox'])
+                    if sign_text:
+                        perception_result["sign_content"] = sign_text['text']
+                        perception_result["sign_distance"] = det['distance']
+                        perception_result["sign_direction"] = det['direction']
+                        break  # 只取第一个识别的标志
+        
+        return perception_result, detections
+    
     # ==================== 辅助函数 ====================
     def get_class_name(self, class_id, lang='en'):
-        """获取类别名称"""
         if lang == 'zh':
             return self.class_names_zh.get(class_id, f'class_{class_id}')
         return self.class_names.get(class_id, f'class_{class_id}')
     
     def set_conf_thresh(self, thresh):
-        """设置置信度阈值"""
         self.conf_thresh = thresh
         self.logger.info(f"置信度阈值设置为: {thresh}")
     
     def set_nms_thresh(self, thresh):
-        """设置 NMS 阈值"""
         self.nms_thresh = thresh
         self.logger.info(f"NMS 阈值设置为: {thresh}")
     
     # ==================== 可视化函数 ====================
     def draw_detections(self, img, detections, show_info=True):
-        """
-        在图像上绘制检测结果
-        
-        Args:
-            img: 原始图像
-            detections: 检测结果（带信息版本）
-            show_info: 是否显示方向和距离信息
-        
-        Returns:
-            img: 绘制后的图像
-        """
+        """在图像上绘制检测结果"""
         colors = {
-            0: (0, 0, 255),    # 施工标志 - 红色
-            1: (0, 255, 0),    # 斑马线 - 绿色
-            2: (255, 0, 0),    # 禁止通行 - 蓝色
-            3: (255, 255, 0),  # 公交站牌 - 青色
-            4: (0, 255, 255),  # 行人 - 黄色
-            5: (255, 0, 255),  # 汽车 - 品红
-            6: (128, 128, 0),  # 自行车 - 橄榄绿
-            7: (0, 128, 128),  # 黑夜行人 - 墨绿
-            8: (128, 0, 128),  # 黑夜汽车 - 紫色
-            9: (128, 128, 128) # 黑夜自行车 - 灰色
+            0: (0, 0, 255), 1: (0, 255, 0), 2: (255, 0, 0),
+            3: (255, 255, 0), 4: (0, 255, 255), 5: (255, 0, 255),
+            6: (128, 128, 0), 7: (0, 128, 128), 8: (128, 0, 128), 9: (128, 128, 128)
         }
         
         for det in detections:
@@ -557,11 +694,8 @@ class YOLODetector:
             name = det.get('class_name_zh', det.get('class_name', 'unknown'))
             
             color = colors.get(cls_id, (0, 255, 0))
-            
-            # 绘制边框
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             
-            # 绘制标签
             if show_info and 'direction' in det and 'distance' in det:
                 label = f"{name}: {conf:.2f} | {det['direction']} {det['distance']:.1f}m"
             else:
@@ -570,29 +704,49 @@ class YOLODetector:
             cv2.putText(img, label, (x1, y1 - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # 绘制 FPS
         fps = self.get_fps()
         cv2.putText(img, f"FPS: {fps}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        return img
+    
+    def draw_perception(self, img, perception_result):
+        """绘制感知结果"""
+        h, w = img.shape[:2]
+        
+        # 显示盲道信息
+        if perception_result['blind_road_detected']:
+            cv2.putText(img, f"盲道: {perception_result['blind_road_direction']} {perception_result['blind_road_distance']:.1f}m",
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # 显示障碍物信息
+        if perception_result['obs_type']:
+            obs_text = f"障碍: {perception_result['obs_type']} {perception_result['direction']} {perception_result['distance']:.1f}m"
+            if perception_result['obs_on_blind_road']:
+                obs_text += " ⚠️在盲道上"
+            cv2.putText(img, obs_text, (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # 显示交通标志信息
+        if perception_result['sign_content']:
+            cv2.putText(img, f"标志: {perception_result['sign_content']} {perception_result['sign_direction']} {perception_result['sign_distance']:.1f}m",
+                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         
         return img
 
 
 # ==================== 多模型检测类 ====================
 class MultiModelDetector:
-    """多模型检测器（融合多个检测结果）"""
+    """多模型检测器"""
     
     def __init__(self):
         self.detectors = {}
     
     def add_detector(self, name, detector):
-        """添加检测器"""
         self.detectors[name] = detector
     
     def detect(self, img, with_info=False):
-        """使用所有模型检测并融合结果"""
         all_detections = []
-        
         for name, detector in self.detectors.items():
             detections = detector.detect(img, with_info)
             if with_info:
@@ -601,34 +755,34 @@ class MultiModelDetector:
                 all_detections.extend(detections)
             else:
                 all_detections.extend(detections)
-        
         return all_detections
 
 
 # ==================== 测试代码 ====================
 if __name__ == '__main__':
-    import sys
-    
-    # 配置
-    BMODEL_PATH = "/data/dataset/bmodels/ten_classes_f32.bmodel"
-    TEST_IMAGE = "/data/dataset/runs/detect/盲道.webp"
-    
-    # 创建检测器
     print("=" * 50)
     print("YOLO Detector 测试")
     print("=" * 50)
     
+    BMODEL_PATH = "/data/dataset/bmodels/ten_classes_f32.bmodel"
+    TEST_IMAGE = "/data/dataset/runs/detect/盲道.webp"
+    
     detector = YOLODetector(BMODEL_PATH, conf_thresh=0.5, nms_thresh=0.45)
     
-    # 测试单张图片
-    print(f"\n检测图片: {TEST_IMAGE}")
-    results = detector.detect_from_file(TEST_IMAGE, with_info=True)
-    
-    print(f"\n检测到 {len(results)} 个目标:")
-    for det in results:
-        print(f"  [{det['class_name_zh']}] {det['confidence']:.2f} | "
-              f"{det['direction']} | 距离: {det['distance']:.1f}m | "
-              f"位置: {det['bbox']}")
+    # 测试多模态感知
+    print(f"\n多模态感知测试 - 图片: {TEST_IMAGE}")
+    img = cv2.imread(TEST_IMAGE)
+    if img is not None:
+        perception_result, detections = detector.perceive(img, with_ocr=True)
+        
+        print("\n感知结果:")
+        print(json.dumps(perception_result, ensure_ascii=False, indent=4))
+        
+        # 绘制结果
+        result_img = detector.draw_detections(img.copy(), detections)
+        result_img = detector.draw_perception(result_img, perception_result)
+        cv2.imwrite('/tmp/perception_result.jpg', result_img)
+        print("\n结果图片已保存到: /tmp/perception_result.jpg")
     
     # 测试摄像头
     print("\n尝试打开摄像头...")
@@ -636,13 +790,10 @@ if __name__ == '__main__':
     if cap.isOpened():
         ret, frame = cap.read()
         if ret:
-            results = detector.detect(frame, with_info=True)
-            print(f"实时检测到 {len(results)} 个目标")
+            perception_result, detections = detector.perceive(frame)
+            print(f"实时感知 - 障碍物: {perception_result['obs_type']}, 盲道检测: {perception_result['blind_road_detected']}")
         cap.release()
     else:
         print("摄像头不可用")
-    
-    # 测试 FPS
-    print(f"\n当前 FPS: {detector.get_fps()}")
     
     print("\n测试完成！")
